@@ -168,27 +168,30 @@ def get_dataloader(net, dataset, data_shape, batch_size, validation:bool, args):
     width, height = data_shape, data_shape
     if validation:
         logger.debug("Creating validation DataLoader")
+        #batchify_fn=Tuple(Stack(), Pad(pad_val=-1))
+        batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
         return gluon.data.DataLoader(
             dataset.transform(YOLO3DefaultValTransform(width, height)),
             batch_size,
-            True,
-            batchify_fn=Tuple(Stack(), Pad(pad_val=-1)),
+            shuffle=True,
+            batchify_fn=batchify_fn,
             last_batch="keep",
             num_workers=args.num_workers
         )
     else:
         if args.no_random_shape:
             logger.debug("Creating DataLoader without random transform")
-            batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
+            #batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
+            batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
             return gluon.data.DataLoader(
-                dataset.transform(YOLO3DefaultTrainTransform(width, height, net, mixup=args.mixup)),
+                dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup)),
                 batch_size, shuffle=True, batchify_fn=batchify_fn, last_batch="discard", num_workers=args.num_workers
             )
         else:
             logger.debug("Creating DataLoader with random transform")
             # Stack images, all targets generated:
             batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-            transform_fns = [YOLO3DefaultTrainTransform(x * 32, x * 32, net, mixup=args.mixup) for x in range(10, 20)]
+            transform_fns = [YOLO3DefaultTrainTransform(x * 32, x * 32, mixup=args.mixup) for x in range(10, 20)]
             return RandomTransformDataLoader(
                 transform_fns, dataset, batch_size=batch_size, interval=10, last_batch="discard",
                 shuffle=True, batchify_fn=batchify_fn, num_workers=args.num_workers
@@ -271,8 +274,6 @@ def pipe_detection_minibatch(
     
     This generator reads batches of records from the stream and converts each into a GluonCV 
     RecordFileDetection.
-    
-    TODO: Un-break it!
     """
     ixbatch = -1
     epoch_end = False
