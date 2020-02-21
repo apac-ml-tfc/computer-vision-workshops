@@ -163,39 +163,51 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def get_dataloader(net, dataset, data_shape, batch_size, validation:bool, args):
-    """Get dataloader."""
-    width, height = data_shape, data_shape
-    if validation:
-        logger.debug("Creating validation DataLoader")
-        #batchify_fn=Tuple(Stack(), Pad(pad_val=-1))
-        batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-        return gluon.data.DataLoader(
-            dataset.transform(YOLO3DefaultValTransform(width, height)),
-            batch_size,
-            shuffle=True,
-            batchify_fn=batchify_fn,
-            last_batch="keep",
-            num_workers=args.num_workers
-        )
-    else:
-        if args.no_random_shape:
-            logger.debug("Creating DataLoader without random transform")
-            #batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
-            batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-            return gluon.data.DataLoader(
-                dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup)),
-                batch_size, shuffle=True, batchify_fn=batchify_fn, last_batch="discard", num_workers=args.num_workers
-            )
-        else:
-            logger.debug("Creating DataLoader with random transform")
-            # Stack images, all targets generated:
-            batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-            transform_fns = [YOLO3DefaultTrainTransform(x * 32, x * 32, mixup=args.mixup) for x in range(10, 20)]
-            return RandomTransformDataLoader(
-                transform_fns, dataset, batch_size=batch_size, interval=10, last_batch="discard",
-                shuffle=True, batchify_fn=batchify_fn, num_workers=args.num_workers
-            )
+# TODO: Remove - No longer used if new data-loading works
+# def get_dataloader(net, dataset, data_shape, batch_size, validation:bool, args):
+#     """Get dataloader."""
+#     width, height = data_shape, data_shape
+#     if validation:
+#         logger.debug("Creating validation DataLoader")
+#         batchify_fn=Tuple(Stack(), Pad(pad_val=-1))
+#         return gluon.data.DataLoader(
+#             dataset.transform(YOLO3DefaultValTransform(width, height)),
+#             batch_size,
+#             shuffle=True,
+#             batchify_fn=batchify_fn,
+#             last_batch="keep",
+#             num_workers=args.num_workers
+#         )
+#     else:
+#         transformed_dataset = dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup))
+#         for ix in range(len(dataset)):
+#             datum = dataset[ix]
+#             img, label = dataset[ix]
+#             tdatum = transformed_dataset[ix]
+#             timg, tlabel = tdatum
+#             print(f"Record {ix} has len {len(datum)}, comprising img shape {img.shape}, label shape{label.shape}. Detections:")
+#             print(label)
+#             print(f"Transformed detections len {len(tdatum)}, label:")
+#             print(tlabel)
+#         if True: #if args.no_random_shape:
+#             logger.debug("Creating DataLoader without random transform")
+#             batchify_fn = Tuple(Stack(), Pad(axis=0, pad_val=-1))
+#             #batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
+#             return gluon.data.DataLoader(
+#                 dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup)),
+#                 batch_size, shuffle=True,
+#                 batchify_fn=batchify_fn,
+#                 last_batch="discard", num_workers=args.num_workers
+#             )
+#         else:
+#             logger.debug("Creating DataLoader with random transform")
+#             # Stack images, all targets generated:
+#             batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
+#             transform_fns = [YOLO3DefaultTrainTransform(x * 32, x * 32, mixup=args.mixup) for x in range(10, 20)]
+#             return RandomTransformDataLoader(
+#                 transform_fns, dataset, batch_size=batch_size, interval=10, last_batch="discard",
+#                 shuffle=True, batchify_fn=batchify_fn, num_workers=args.num_workers
+#             )
 
 def save_params(net, best_map, current_map, epoch, save_interval, prefix):
     current_map = float(current_map)
@@ -207,7 +219,7 @@ def save_params(net, best_map, current_map, epoch, save_interval, prefix):
     if save_interval and epoch % save_interval == 0:
         net.save_parameters('{:s}_{:04d}_{:.4f}.params'.format(prefix, epoch, current_map))
 
-def validate(net, val_data_channel, epoch, ctx, eval_metric, args):
+def validate(net, val_data_channel, epoch, ctx, eval_metric, transforms, batchify_fn, args):
     """Test on validation dataset."""
     eval_metric.reset()
     val_data_gen = pipe_detection_minibatch(epoch, channel=val_data_channel, batch_size=args.stream_batch_size)
@@ -217,9 +229,19 @@ def validate(net, val_data_channel, epoch, ctx, eval_metric, args):
     net.hybridize()
     metric_updated = False
     for val_dataset in val_data_gen:
-        val_dataloader = get_dataloader(
-            net, val_dataset, args.data_shape, args.batch_size, validation=True, args=args
+        val_dataloader = gluon.data.DataLoader(
+            dataset.transform(transforms),
+            args.batch_size,
+            shuffle=True,
+            batchify_fn=batchify_fn,
+            last_batch="keep",
+            num_workers=args.num_workers
         )
+
+        # TODO: Remove if new data-loading above works
+#         val_dataloader = get_dataloader(
+#             net, val_dataset, args.data_shape, args.batch_size, validation=True, args=args
+#         )
         for batch in val_dataloader:
             data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0, even_split=False)
             label = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0, even_split=False)
@@ -441,6 +463,19 @@ def train(net, async_net, ctx, args):
     # Evaluation Metrics:
     val_metric = VOC07MApMetric(iou_thresh=0.5)
 
+    # Data transformations:
+    train_batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
+    train_transforms = (
+        YOLO3DefaultTrainTransform(args.data_shape, args.data_shape, net=async_net, mixup=args.mixup)
+        if args.no_random_shape else
+        [YOLO3DefaultTrainTransform(x * 32, x * 32, net=async_net, mixup=args.mixup) for x in range(10, 20)]
+    )
+    validation_batchify_fn = None
+    validation_transforms = None
+    if args.validation:
+        validation_batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
+        validation_transforms = YOLO3DefaultValTransform(args.data_shape, args.data_shape)
+
     logger.info(args)
     logger.info(f"Start training from [Epoch {args.start_epoch}]")
     best_map = [0]
@@ -470,10 +505,27 @@ def train(net, async_net, ctx, args):
             # TODO: Mixup is kinda rubbish if it's only within a (potentially small) batch
             if args.mixup:
                 train_dataset = MixupDetection(train_dataset)
+
+            # Create dataloader for the stream-batch:
+            if args.no_random_shape:
+                logger.debug("Creating train DataLoader without random transform")
+                train_dataloader = gluon.data.DataLoader(
+                    train_dataset.transform(train_transforms),
+                    args.batch_size, shuffle=True,
+                    batchify_fn=train_batchify_fn,
+                    last_batch="discard", num_workers=args.num_workers
+                )
+            else:
+                logger.debug("Creating train DataLoader with random transform")
+                train_dataloader = RandomTransformDataLoader(
+                    train_transforms, train_dataset, batch_size=args.batch_size, interval=10, last_batch="discard",
+                    shuffle=True, batchify_fn=train_batchify_fn, num_workers=args.num_workers
+                )
             
-            train_dataloader = get_dataloader(
-                async_net, train_dataset, args.data_shape, args.batch_size, validation=False, args=args
-            )
+            # TODO: Remove if above dataloading works
+            #train_dataloader = get_dataloader(
+            #    async_net, train_dataset, args.data_shape, args.batch_size, validation=False, args=args
+            #)
             
             if args.mixup:
                 logger.info("Shuffling stream-batch")
@@ -537,7 +589,7 @@ def train(net, async_net, ctx, args):
         if not (epoch + 1) % args.val_interval:
             logger.info(f"Validating epoch {epoch + 1}")
             # consider reduce the frequency of validation to save time
-            map_name, mean_ap = validate(net, args.validation, epoch, ctx, VOC07MApMetric(iou_thresh=0.5), args)
+            map_name, mean_ap = validate(net, args.validation, epoch, ctx, VOC07MApMetric(iou_thresh=0.5), validation_transforms, validation_batchify_fn, args)
             if isinstance(map_name, list):
                 val_msg = '\n'.join(['{}={}'.format(k, v) for k, v in zip(map_name, mean_ap)])
                 #train_msg = '\n'.join(['{}={}'.format(k, v) for k, v in zip(map_name_train, mean_ap_train)])
@@ -606,7 +658,7 @@ if __name__ == "__main__":
         #    net = get_model(net_name, pretrained=True)            
         #else:
         #    net = get_model(net_name, pretrained_base=True)
-        #net.reset_class(classes)            
+        #net.reset_class(classes)
         async_net = net
 
     if args.resume.strip():
