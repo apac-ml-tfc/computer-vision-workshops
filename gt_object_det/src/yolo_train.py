@@ -5,22 +5,14 @@ import argparse
 import json
 import logging
 import os
-import subprocess
-import sys
 from tempfile import TemporaryDirectory
 import time
 import warnings
 
-# Inline Installations:
-import numpy as np
-subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "gluoncv"])
+# Since the MXNet container supports it, prefer requirements.txt over inline installations:
+# subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "gluoncv"])
 
 # External Dependencies:
-from matplotlib import pyplot as plt
-import mxnet as mx
-from mxnet import nd
-from mxnet import gluon
-from mxnet import autograd
 import gluoncv as gcv
 from gluoncv import data as gdata
 from gluoncv import utils as gutils
@@ -30,13 +22,17 @@ from gluoncv.data.batchify import Tuple, Stack, Pad
 from gluoncv.data.transforms.presets.yolo import YOLO3DefaultTrainTransform
 from gluoncv.data.transforms.presets.yolo import YOLO3DefaultValTransform
 from gluoncv.data.dataloader import RandomTransformDataLoader
-#from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
+from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 from gluoncv.utils import LRScheduler, LRSequential
+from matplotlib import pyplot as plt
+import mxnet as mx
+from mxnet import autograd
+from mxnet import gluon
+from mxnet import nd
+import numpy as np
 
 # Local Dependencies:
-# TODO: Replace with standard gluoncv.utils.metrics.voc_detection.VOC07MApMetric?
-from hello import VOC07MApMetric
 # Export functions for deployment in SageMaker:
 from sm_gluoncv_hosting import *
 
@@ -163,52 +159,6 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-# TODO: Remove - No longer used if new data-loading works
-# def get_dataloader(net, dataset, data_shape, batch_size, validation:bool, args):
-#     """Get dataloader."""
-#     width, height = data_shape, data_shape
-#     if validation:
-#         logger.debug("Creating validation DataLoader")
-#         batchify_fn=Tuple(Stack(), Pad(pad_val=-1))
-#         return gluon.data.DataLoader(
-#             dataset.transform(YOLO3DefaultValTransform(width, height)),
-#             batch_size,
-#             shuffle=True,
-#             batchify_fn=batchify_fn,
-#             last_batch="keep",
-#             num_workers=args.num_workers
-#         )
-#     else:
-#         transformed_dataset = dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup))
-#         for ix in range(len(dataset)):
-#             datum = dataset[ix]
-#             img, label = dataset[ix]
-#             tdatum = transformed_dataset[ix]
-#             timg, tlabel = tdatum
-#             print(f"Record {ix} has len {len(datum)}, comprising img shape {img.shape}, label shape{label.shape}. Detections:")
-#             print(label)
-#             print(f"Transformed detections len {len(tdatum)}, label:")
-#             print(tlabel)
-#         if True: #if args.no_random_shape:
-#             logger.debug("Creating DataLoader without random transform")
-#             batchify_fn = Tuple(Stack(), Pad(axis=0, pad_val=-1))
-#             #batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-#             return gluon.data.DataLoader(
-#                 dataset.transform(YOLO3DefaultTrainTransform(width, height, mixup=args.mixup)),
-#                 batch_size, shuffle=True,
-#                 batchify_fn=batchify_fn,
-#                 last_batch="discard", num_workers=args.num_workers
-#             )
-#         else:
-#             logger.debug("Creating DataLoader with random transform")
-#             # Stack images, all targets generated:
-#             batchify_fn = Tuple(*([Stack() for _ in range(6)] + [Pad(axis=0, pad_val=-1) for _ in range(1)]))
-#             transform_fns = [YOLO3DefaultTrainTransform(x * 32, x * 32, mixup=args.mixup) for x in range(10, 20)]
-#             return RandomTransformDataLoader(
-#                 transform_fns, dataset, batch_size=batch_size, interval=10, last_batch="discard",
-#                 shuffle=True, batchify_fn=batchify_fn, num_workers=args.num_workers
-#             )
-
 def save_params(net, best_map, current_map, epoch, save_interval, prefix):
     current_map = float(current_map)
     if current_map > best_map[0]:
@@ -230,7 +180,7 @@ def validate(net, val_data_channel, epoch, ctx, eval_metric, transforms, batchif
     metric_updated = False
     for val_dataset in val_data_gen:
         val_dataloader = gluon.data.DataLoader(
-            dataset.transform(transforms),
+            val_dataset.transform(transforms),
             args.batch_size,
             shuffle=True,
             batchify_fn=batchify_fn,
@@ -318,12 +268,13 @@ def pipe_detection_minibatch(
                 os.mknod(batch_idx_file)
             except OSError:
                 pass
-            
+
             # Stream batch of data in to temporary batch_records file (pair):
             batch_records = mx.recordio.MXIndexedRecordIO(batch_idx_file, batch_records_file, "w")
             image_raw = None
             image_meta = None
             ixdatum = 0
+            invalid = False
             while (ixdatum < batch_size):
                 # Read from the SageMaker stream:
                 raw = epoch_records.read()
@@ -354,10 +305,27 @@ def pipe_detection_minibatch(
                             f"Bad stream {epoch_file}: Missing annotations for record {ixdatum}...\n"
                         )
                     else:
-                        image_raw = raw # TODO: It's weird that we don't have to unpack() this?
+                        image_raw = raw
+                        # Since a stream-batch becomes an iterable GluonCV dataset, to which
+                        # downstream transformations are applied in bulk, it's best to weed out any
+                        # corrupted files here if possible rather than risk a whole mini-batch or
+                        # stream-batch getting discarded:
+                        try:
+                            img = mx.image.imdecode(bytearray(raw))
+                            logger.debug(f"Loaded image shape {img.shape}")
+                        except ValueError as e:
+                            logger.exception("Failed to load image data - skipping...")
+                            invalid = True
+                        # TODO: Since we already parse images, try to buffer the tensors not JPG
                 
                 # If both image and annotation have been collected, we're ready to pack for GluonCV:
-                if (image_raw and image_meta):
+                if (image_raw is not None and len(image_raw) and image_meta):
+                    if invalid:
+                        image_raw = None
+                        image_meta = None
+                        invalid = False
+                        continue
+
                     if (image_meta.get("image_size")):
                         image_width = image_meta["image_size"][0]["width"]
                         image_height = image_meta["image_size"][0]["height"]
@@ -392,7 +360,7 @@ def pipe_detection_minibatch(
                     image_raw = None
                     image_meta = None
                     ixdatum += 1
-            
+
             # Close the write stream (we'll re-open the file-pair to read):
             batch_records.close()
 
@@ -423,7 +391,7 @@ def train(net, async_net, ctx, args):
         lr_decay_epoch = list(range(args.lr_decay_period, args.epochs, args.lr_decay_period))
     else:
         lr_decay_epoch = [int(i) for i in args.lr_decay_epoch.split(',')]
-    
+
     lr_scheduler = LRSequential([
         LRScheduler("linear", base_lr=0, target_lr=args.lr,
                     nepochs=args.warmup_epochs, iters_per_epoch=args.batch_size),
@@ -500,7 +468,9 @@ def train(net, async_net, ctx, args):
         net.hybridize()
         
         logger.debug(f'Input data dir contents: {os.listdir("/opt/ml/input/data/")}')
-        train_data_gen = pipe_detection_minibatch(epoch, channel=args.train, batch_size=args.stream_batch_size)
+        train_data_gen = pipe_detection_minibatch(
+            epoch, channel=args.train, batch_size=args.stream_batch_size
+        )
         for ix_streambatch, train_dataset in enumerate(train_data_gen):
             # TODO: Mixup is kinda rubbish if it's only within a (potentially small) batch
             if args.mixup:
@@ -521,12 +491,7 @@ def train(net, async_net, ctx, args):
                     train_transforms, train_dataset, batch_size=args.batch_size, interval=10, last_batch="discard",
                     shuffle=True, batchify_fn=train_batchify_fn, num_workers=args.num_workers
                 )
-            
-            # TODO: Remove if above dataloading works
-            #train_dataloader = get_dataloader(
-            #    async_net, train_dataset, args.data_shape, args.batch_size, validation=False, args=args
-            #)
-            
+
             if args.mixup:
                 logger.info("Shuffling stream-batch")
                 # TODO(zhreshold): more elegant way to control mixup during runtime
@@ -539,9 +504,42 @@ def train(net, async_net, ctx, args):
                         train_dataloader._dataset.set_mixup(None)
                     except AttributeError:
                         train_dataloader._dataset._data.set_mixup(None)
-            
-            logger.info("Training on stream-batch %d (%d records)" % (ix_streambatch, len(train_dataset)))
-            for i, batch in enumerate(train_dataloader):
+
+            logger.info(
+                "Training on stream-batch %d (%d records)" % (ix_streambatch, len(train_dataset))
+            )
+            # TODO: Improve stream-batching robustness to drop loop guard clauses
+            # While it would be nice to simply `for i, batch in enumerate(train_dataloader):`,
+            # corrupted image buffers are somehow sneaking through the stream-batch at the moment.
+            #
+            # For now, we catch and tolerate these errors - trying to resume stream-batch process
+            # where possible and otherwise discarding the remainder of the stream-batch :-(
+            done = False
+            i = -1
+            dataiter = iter(train_dataloader)
+            while not done:
+                i += 1
+                batch = None
+                while not batch:
+                    try:
+                        batch = next(dataiter)
+                    except StopIteration:
+                        done = True
+                        break
+                    except ValueError:
+                        # Some problem with the minibatch prevented loading - try the next
+                        logger.warn("Failed to load minibatch %d, trying next..." % (i))
+                        i += 1
+                    except:
+                        logger.error(
+                            "Failed to iterate minibatch %d, discarding stream-batch %d"
+                            % (i, ix_streambatch)
+                        )
+                        break
+
+                if not batch:
+                    logger.info("Stream batch %d no minibatches left to process" % ix_streambatch)
+                    break
                 logger.info("Epoch %d, stream batch %d, minibatch %d" % (epoch, ix_streambatch, i))
 
                 batch_size = batch[0].shape[0]
