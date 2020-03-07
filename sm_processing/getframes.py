@@ -1,12 +1,29 @@
-"""SageMaker Processing script to extract frame images from videos"""
+"""SageMaker Processing script to extract frame images from videos
 
-# Built-Ins:
+Some quirks of this script for demonstration purposes:
+
+- We support both inline installation of OpenCV (for using with the SageMaker default Scikit-Learn
+  container) and pre-installation (for using with a custom container where OpenCV is already
+  installed, identified by setting the `OPENCV_PREINSTALLED` environment variable)
+- We offer a `--frames-per-second` parameter (to demonstrate in the associated notebook how to pass
+  parameters to a SageMaker processing job), but haven't actually implemented FPS support.
+- We implement a naive parallelization solution (processing every Nth file) to demonstrate how a
+  Processing script can identify the number of instances running the job, and which instance it's
+  running in... But this should **not** be necessary for this use case: Instead use ProcessingInput
+  `s3_data_distribution_type="ShardedByS3Key"` - which will split input data between nodes
+  automatically, saving resources!
+
+"""
+
+# Python Built-Ins:
 import argparse
 import json
 import os
 import shutil
 import subprocess
 import sys
+from typing import List
+import warnings
 
 # OpenCV requires some OS-level dependencies not in the standard container.
 # For this example comparing the built-in container to a custom one, we'll use the same script file
@@ -24,28 +41,32 @@ import cv2
 
 SUPPORTED_EXTENSIONS = ("avi", "mp4")
 
-def existing_folder_arg(raw_value):
+def existing_folder_arg(raw_value:str) -> str:
     """argparse type for a folder that must already exist"""
     value = str(raw_value)
     if not os.path.isdir(value):
         raise argparse.ArgumentTypeError("%s is not a directory" % value)
     return value
 
-def list_arg(raw_value):
+def list_arg(raw_value:str) -> List[str]:
     """argparse type for a list of strings"""
     return str(raw_value).split(",")
 
-def parse_args():
+def parse_args() -> None:
+    """Load configuration from CLI and SageMaker environment variables"""
     parser = argparse.ArgumentParser(description="Extract frame images from video files")
     parser.add_argument("--input", type=existing_folder_arg,
         default="/opt/ml/processing/input/videos",
-        help="Source folder of video files."
+        help="Source folder of video files",
     )
     parser.add_argument("--output", type=str, default="/opt/ml/processing/frames",
-        help="Target folder for saving frame images."
+        help="Target folder for saving frame images",
     )
     parser.add_argument("--frames-per-second", type=float, default=0,
-        help="(Approximate) number of frames per second to save, or save every frame if 0."
+        help="(Approximate) number of frames per second to save, or save every frame if 0",
+    )
+    parser.add_argument("--custom-sharding", action="store_true",
+        help="Set to use software-based sharding, instead of assuming pre-sharded data",
     )
     
     # Unlike in training jobs (which have `SM_HOSTS` and `SM_CURRENT_HOST` env vars), processing
@@ -59,8 +80,8 @@ def parse_args():
         print("/opt/ml/config/resourceconfig.json not found: default to one instance")
         pass # Ignore
 
-    # In case the config file is not found (e.g. for local running), the parallelization config can
-    # be provided through CLI for convenience:
+    # In case the config file is not found (e.g. for local running), the same configuration can be
+    # provided through CLI for convenience:
     parser.add_argument("--hosts", type=list_arg,
         default=resconfig.get("hosts", ["unknown"]),
         help="Comma-separated list of host names running the job"
@@ -72,9 +93,27 @@ def parse_args():
 
     return parser.parse_args()
 
-def extract_frames(src, dest, fps=0, shard_ix=0, shard_count=1):
+def extract_frames(src:str, dest:str, fps:float=0, shard_ix:int=0, shard_count:int=1) -> None:
+    """Extract frame images from (a shard subset of) video files in src folder
+
+    If sharding is enabled (by setting `shard_count` > 1), only every `shard_count`th file
+    (alphabetically by filename) will be processed.
+
+    Parameters
+    ----------
+    src : str
+        Source folder containing video files
+    dest : str
+        Destination folder to write image files to
+    fps : float
+        Frames per second limit is **not implemented!** 0 = source file FPS
+    shard_ix : int
+        Which shard to process, for naive filename-based sharding
+    shard_count : int
+        Number of shards, for naive filename-based sharding
+    """
     # Getting the FPS of a video is major_ver dependent in OpenCV:
-    (cv_major_ver, _, _) = (cv2.__version__).split('.')
+    (cv_major_ver, _, _) = (cv2.__version__).split(".")
     
     if fps != 0:
         raise NotImplementedError("FPS is a parameter, but not yet implemented!")
@@ -111,7 +150,7 @@ def extract_frames(src, dest, fps=0, shard_ix=0, shard_count=1):
             success, image = vidcap.read()
             count += 1
         print()
-        print(f"Captured {count} frames")
+        print(f"Captured {count} frames from {filename}")
     print(f"Output to {dest}:")
     print(os.listdir(dest))
 
@@ -123,10 +162,23 @@ if __name__ == "__main__":
     print(os.environ)
 
     os.makedirs(args.output, exist_ok=True)
-    extract_frames(
-        args.input,
-        args.output,
-        fps=args.frames_per_second,
-        shard_ix=args.hosts.index(args.current_host),
-        shard_count=len(args.hosts)
-    )
+    if args.custom_sharding:
+        warnings.warn(
+            "Using custom (code-based) sharding to ignore extra input files replicated between "
+            "instances... This is implemented as an example of instance count monitoring only, "
+            "and applications should use ProcessingInput `s3_data_distribution_type` = "
+            "'ShardedByS3Key' instead to save time and resources!"
+        )
+        extract_frames(
+            args.input,
+            args.output,
+            fps=args.frames_per_second,
+            shard_ix=args.hosts.index(args.current_host),
+            shard_count=len(args.hosts)
+        )
+    else:
+        extract_frames(
+            args.input,
+            args.output,
+            fps=args.frames_per_second,
+        )
