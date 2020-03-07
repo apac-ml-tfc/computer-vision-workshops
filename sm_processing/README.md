@@ -13,4 +13,6 @@ This example isn't intended as a reference implementation of OpenCV frame extrac
 
 * How to use dependency libraries that aren't available in the SageMaker base container images (and especially those like OpenCV that might require extra OS-level libraries beyond a simple `pip install`)
 * How to pass parameters in to a processing job (like frame rate, which we pass in but don't implement in the container logic)
-* A basic pattern to write parallelizable jobs by sharding the input (since SageMaker Processing, as a generalist tool unlike SageMaker Batch Transform for 1-1 maps, doesn't handle input data distribution for us)
+* How a processing instance can discover the total number of instances executing the current job, and its place in the list, since this process is a little different than the `SM_HOSTS` and `SM_CURRENT_HOSTS` environment variables often used in SageMaker training jobs.
+
+Note that this use case **doesn't need** to identify instance count (because SageMaker can distribute input data between instances automatically with the [s3_data_distribution_type](https://sagemaker.readthedocs.io/en/stable/processing.html#sagemaker.processing.ProcessingInput) parameter), but the logic may be useful for other applications e.g. master-slave cluster architectures.
