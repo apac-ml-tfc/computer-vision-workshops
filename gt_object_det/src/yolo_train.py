@@ -470,6 +470,10 @@ def pipe_detection_minibatch(
             # Close the write stream (we'll re-open the file-pair to read):
             batch_records.close()
 
+            if ixdatum == 0:
+                logger.debug("Reached end of stream with no valid records - discarding")
+                break
+
             if (epoch_end and discard_partial_final):
                 logger.debug("Discarding final partial batch")
                 break # (Don't yield the part-completed batch)
