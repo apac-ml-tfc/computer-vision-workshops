@@ -30,7 +30,6 @@ import config
 import data
 from yolo3.convert import load_darknet_as_keras
 from yolo3.model import preprocess_true_boxes, yolo_body, yolo_loss
-from yolo3.util import get_random_data
 
 
 assert tf.__version__.rpartition(".")[0] == "1.12", (
