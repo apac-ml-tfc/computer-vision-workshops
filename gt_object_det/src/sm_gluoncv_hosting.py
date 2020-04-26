@@ -5,9 +5,7 @@ read and use a GluonCV model.
 """
 
 # Python Built-Ins:
-import errno
 from io import StringIO
-import json
 import logging
 import os
 
@@ -17,11 +15,14 @@ import numpy as np
 from gluoncv.data.transforms.bbox import resize as resize_bboxes
 from gluoncv.data.transforms.presets.yolo import transform_test
 
+# Local Dependencies:
+import config
+
 logger = logging.getLogger()
 
 
 def model_fn(model_dir):
-    """Customized inference container function to load a Gluon model.
+    """Customized inference container function to load a Gluon model and additional config file.
 
     Exporting model_fn overrides the default SageMaker MXNet container model loading behaviour
     when a worker is first started up.
@@ -74,18 +75,25 @@ def model_fn(model_dir):
         ["data"],
         os.path.join(model_dir, param_file),
     )
-    return net
+
+    # Finally, load the associated inference configuration file:
+    inference_config = config.InferenceConfig.load(
+        os.path.join(model_dir, f"{model_prefix}-inference-config.json")
+    )
+    return (net, inference_config)
 
 
-def transform_fn(net, raw_data, input_content_type, output_content_type):
+def transform_fn(model, raw_data, input_content_type, output_content_type):
     """
     Transform a request using the Gluon model. Called once per request.
-    :param net: The Gluon model.
+    :param model: Tuple of the Gluon model and inference config objects
     :param data: The request payload.
     :param input_content_type: The request content type.
     :param output_content_type: The (desired) response content type.
     :return: response payload and content type.
     """
+    # Unpack the neural net and the additional algo config:
+    net, inference_config = model
     # First step: Read the input data:
     resized = False
     batch = False  # TODO: Support batch properly for numpy inputs
@@ -99,8 +107,8 @@ def transform_fn(net, raw_data, input_content_type, output_content_type):
             batch = True
         elif n_data_dims != 3:
             raise ValueError(
-                "Expect a [ndata x nchannels x width x height] (YOLO-normalized) batch image "
-                f"array, or a single image with batch dimension omitted... Got shape {data.shape}"
+                "Expect a [ndata x nchannels x width x height] (YOLO-normalized) batch image array, "
+                f"or a single image with batch dimension omitted... Got shape {data.shape}"
             )
     elif input_content_type == "application/x-image" or input_content_type.startswith("image/"):
         logger.info(f"Got image request {input_content_type}")
@@ -108,8 +116,7 @@ def transform_fn(net, raw_data, input_content_type, output_content_type):
         img_raw_shape = img_raw.shape[:-1] # Skip the channels dimension
         logger.info(f"Raw image shape {img_raw.shape}")
 
-        # TODO: Parameterize data_shape from training run shape
-        data, _ = transform_test(img_raw, short=416)
+        data, _ = transform_test(img_raw, short=inference_config.image_size)
         img_transformed_shape = data.shape[2:] # Channels dimension is leading now
         resized = True
 
