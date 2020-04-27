@@ -7,7 +7,7 @@ Accept JPEGs/PNGs of arbitrary size: resize them to the model input shape, and r
 """
 
 # Python Built-Ins:
-from collections import namedtuple
+from collections import defaultdict, namedtuple
 from io import BytesIO
 import json
 import logging
@@ -18,12 +18,14 @@ from PIL import Image
 import requests
 
 # Local Dependencies
-from yolo3 import util
+from yolo3 import postproc, util
 
 logging.basicConfig()
 logger = logging.getLogger()
 
-CustomContext = namedtuple("CustomContext", ["boxes_mapper"])
+# TODO: Double-check all our size and box orders tie up (width-major or height-major?)
+# raw_image_shape is a width,height tuple (same as PIL Image.size produces)
+CustomContext = namedtuple("CustomContext", ["boxes_mapper", "raw_image_shape"])
 
 def handler(data, context):
     """Overall request handler
@@ -71,7 +73,10 @@ def _input_handler(raw_data, context):
                 "Expect a [ndata x nchannels x width x height] (YOLO-normalized) batch image "
                 "array, or a single image with batch dimension omitted... Got shape {}".format(data.shape)
             )
-        return json.dumps({ "instances": [data.tolist()] }), CustomContext(None)
+        return (
+            json.dumps({ "instances": [data.tolist()] }),
+            CustomContext(None, (416, 416)),
+        )
     elif (
         context.request_content_type == "application/x-image"
         or context.request_content_type.startswith("image/")
@@ -80,12 +85,15 @@ def _input_handler(raw_data, context):
         img_raw = Image.open(BytesIO(raw_data.read()))
         logger.info("Raw image shape %s", img_raw.size)
         # TODO: Parameterize data_shape from training run shape
-        img_resized, inverse_mapper = util.letterbox_image(img_raw, (416, 416), boxes="invert")
-        data = np.array(util.letterbox_image(img_raw, (416, 416)))
+        if img_raw.size[0] == 416 and img_raw.size[1] == 416:
+            img_resized = img_raw
+            inverse_mapper = None
+        else:
+            img_resized, inverse_mapper = util.letterbox_image(img_raw, (416, 416), boxes="invert")
 
-        logger.info("Transformed image len %s, image shape %s", len(data), data.shape)
-        logger.info("Parsed input shape %s", data.shape)
-        return json.dumps({ "instances": [data.tolist()] }), CustomContext(inverse_mapper)
+        data = np.array(img_resized)
+        logger.info("Transformed image shape %s", data.shape)
+        return json.dumps({ "instances": [data.tolist()] }), CustomContext(inverse_mapper, img_raw.size)
     else:
         logger.error("Got unexpected request content type %s", input_content_type)
         raise ValueError("Unsupported request content type {}".format(input_content_type))
@@ -105,15 +113,55 @@ def _output_handler(data, context, custom_context):
     response_content_type = context.accept_header
     prediction = data.content
 
-    if custom_context.boxes_mapper:
-        # TODO: Can't rescale the bounding box outputs until we're outputting bounding boxes!
-        warnmsg = (
-            "Didn't adjust raw results to reflect image re-scaling, since bounding box output layer is not "
-            "yet implemented!"
-        )
-        logger.warning(warnmsg)
-        pred_parsed = json.loads(prediction.decode("utf-8"))
-        pred_parsed["warning"] = warnmsg
-        prediction = json.dumps(pred_parsed).encode("utf-8")
+    # The TFServing result.predictions is a list (batch dim) of dicts (output name) of array lists.
+    # We unpack the batch dimension into each output's array, and return an alphabetical list of the
+    # outputs (which are named according to the output layer index):
+    preds_parsed = json.loads(prediction.decode("utf-8"))["predictions"]
+    output_dict = defaultdict(list)
+    for prediction in preds_parsed:
+        for output_id in prediction:
+            output_dict[output_id] = output_dict[output_id] + [prediction[output_id]]
+    
+    output_ids = sorted(output_dict.keys())
+    logger.info("Output IDs %s", output_ids)
+    raw_output = [np.stack(output_dict[k], axis=0) for k in output_ids]
 
-    return prediction, response_content_type
+    logger.info(
+        "Raw output is [{}]".format((
+            ", ".join([
+                "Array<{}, {}>".format(o.shape, o.dtype)
+                for o in raw_output
+            ])
+        ))
+    )
+
+    # TODO: postproc.yolo_eval expects batch dim but is not actually set up to calculate on batches
+    boxes, scores, classes = postproc.yolo_eval(
+        raw_output,
+        np.array([[10,13], [16,30], [33,23], [30,61], [62,45], [59,119], [116,90], [156,198], [373,326]]),
+        2,
+        np.array([416, 416]),
+        max_boxes=30,
+        score_threshold=.2,
+        iou_threshold=.5,
+    )
+
+    # Re-scale the bounding boxes if the image was resized in pre-processing:
+    if custom_context.boxes_mapper:
+        boxes = custom_context.boxes_mapper(boxes)
+
+    # Finally, normalize the coords and combine into a single matrix for consistency with other algos:
+    boxes[:, [0, 2]] = boxes[:, [0, 2]] / custom_context.raw_image_shape[0]
+    boxes[:, [1, 3]] = boxes[:, [1, 3]] / custom_context.raw_image_shape[1]
+    result = {
+        "predictions": np.concatenate(
+            [
+                classes.reshape([-1, 1]),
+                scores.reshape([-1, 1]),
+                boxes,
+            ],
+            axis=1
+        ).tolist()
+    }
+
+    return json.dumps(result).encode("utf-8"), response_content_type
