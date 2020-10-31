@@ -1,0 +1,5 @@
+expiringdict
+matplotlib
+numpy
+Pillow
+sagemaker>=2,<3

@@ -1,0 +1,80 @@
+# AWS SAM template for a Semantic Segmentation proxy Lambda function
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Parameters:
+  SageMakerEndpoint:
+    Description: SageMaker Semantic Segmentation endpoint name
+    Type: String
+Resources:
+
+  # We'll create a role specifically for our function, and give it a pretty minimal permission set.
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: InvokeSageMakerEndpoint
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # (Extra DescribeEndpoint* permissions required by SageMaker SDK Predictor)
+              - Sid: InvokeEndpoint
+                Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeEndpoint'
+                  - 'sagemaker:InvokeEndpoint'
+                Resource:
+                  # You'll need to broaden this if wanting to allow calling other endpoints via event parameters:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpoint}'
+              - Sid: DescribeEndpointConfig
+                Effect: Allow
+                Action:
+                  - 'sagemaker:DescribeEndpointConfig'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:*'
+              # (You'll need logging permissions if you want to see logs!)
+              - Sid: CreateLogGroup
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: LogEvents
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      # TODO: If expecting to use ImageS3Uri inputs, you'll need some kind of S3 access! Preferably a narrow
+      # grant, rather than something broad like this:
+      # ManagedPolicyArns:
+      #   - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+
+  # The Lambda itself
+  FunctionCallModel:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Description: Call Semantic Segmentation model and post-process result
+      Handler: main.handler
+      # 2240MB seems to work with images around 1440p resolution. Because this Lambda uses library components
+      # you may sometimes see 'exited/killed' errors rather than actual Python "MemoryError" when memory is
+      # too low. Remember that AWS Lambda CPU allocation scales with allocated memory too, for timeout config
+      MemorySize: 2240
+      Runtime: python3.7
+      Role: !GetAtt LambdaRole.Arn
+      # Consider that your function timeout must accommodate both the SageMaker model latency and the
+      # post-processing done in the Lambda:
+      Timeout: 120
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT: !Ref SageMakerEndpoint
+      CodeUri: ./fn-sseg/
