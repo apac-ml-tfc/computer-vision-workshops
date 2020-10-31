@@ -1,0 +1,11 @@
+# matplotlib 3.0 (see below) requires kiwisolver>=1.0.1, but kiwisolver==1.2.0 requires Python v3.6 too, so:
+kiwisolver<1.2
+
+# matplotlib >=3.1+ requires Python >=3.6. At the time of writing, SM TensorFlow 1.12/py3 was meeting this
+# req in training but not serving container.
+# (See https://github.com/aws/sagemaker-tensorflow-serving-container/issues/133)
+matplotlib>=2.1.1,<3.1
+
+# Default Pillow instance on TFv1.12/py3 training container is 6.0.0, but it's not available on the serving
+# container: So we just ask to install the same major version:
+Pillow>=6.0,<7.0

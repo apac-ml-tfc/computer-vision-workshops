@@ -1,0 +1,3 @@
+This implementation of YOLOv3 is adapted from the below (MIT-licensed) project:
+
+https://github.com/qqwweee/keras-yolo3
